@@ -258,6 +258,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/engine/NativeRuntime.cpp \
 	runtime/engine/FdTransport.cpp \
 	runtime/engine/MemoryAudit.cpp \
+	runtime/engine/RuntimeProfile.cpp \
 	runtime/engine/Status.cpp \
 	runtime/model/WeightStore.cpp \
 	runtime/model/Qwen3_6Moe.cpp \

@@ -27,6 +27,8 @@ struct HostMemoryPages {
     const HostMemoryPages &pages, uint64_t pageSize,
     uint64_t physicalMemoryBytes) noexcept;
 [[nodiscard]] std::optional<uint64_t> queryHostAvailableMemory() noexcept;
+// hw.memsize, or 0 when it cannot be read.
+[[nodiscard]] uint64_t queryHostPhysicalMemory() noexcept;
 
 enum class MemoryPressure : uint8_t {
   Normal,
@@ -56,6 +58,12 @@ memoryPressureName(MemoryPressure pressure) noexcept {
 inline constexpr uint64_t kHostWarningMarginBytes = 1ULL << 30;
 inline constexpr uint64_t kHostRecoveryMarginBytes = 2ULL << 30;
 
+// Without pressure, an engine idle this long returns empty KV backing and idle
+// state buffers once host usage reaches the configured percentage. Prefixes
+// stay cached; only memory that holds nothing is released.
+inline constexpr double kIdleReclaimDelayMilliseconds = 30'000.0;
+inline constexpr uint32_t kDefaultIdleReclaimPercent = 60;
+
 struct MemoryGovernorSnapshot {
   uint64_t limitBytes = 0;
   uint64_t observedResidentBytes = 0;
@@ -68,6 +76,7 @@ struct MemoryGovernorSnapshot {
   uint64_t deniedReservations = 0;
   bool hostMeasurementValid = false;
   uint64_t hostAvailableBytes = 0;
+  uint64_t hostPhysicalBytes = 0;
   uint64_t hostReserveBytes = 0;
   uint64_t hostHeadroomBytes = 0;
   MemoryPressure systemPressure = MemoryPressure::Normal;
@@ -88,14 +97,26 @@ struct MemoryReclaimDirective {
 // pressure is never offset by bytes reclaimed earlier in the same episode.
 class MemoryPressurePolicy final {
 public:
+  explicit MemoryPressurePolicy(
+      uint32_t idleReclaimPercent = kDefaultIdleReclaimPercent) noexcept
+      : idleReclaimPercent_(idleReclaimPercent) {}
+
   // requestWaiting reports whether a request cannot proceed for want of
   // memory. Without one the pass is speculative and keeps the resume point.
+  // engineIdle reports that no request is active or pending.
   [[nodiscard]] MemoryReclaimDirective
   update(const MemoryGovernorSnapshot &snapshot, double nowMilliseconds,
-         bool requestWaiting) noexcept;
+         bool requestWaiting, bool engineIdle = false) noexcept;
 
 private:
+  [[nodiscard]] bool idleReclaimDue(const MemoryGovernorSnapshot &snapshot,
+                                    double nowMilliseconds,
+                                    bool engineIdle) noexcept;
+
+  uint32_t idleReclaimPercent_ = kDefaultIdleReclaimPercent;
   double nextReclaimMilliseconds_ = 0.0;
+  // Negative while the engine is busy.
+  double idleSinceMilliseconds_ = -1.0;
 };
 
 // The sole physical-memory admission ledger. It does not allocate, evict, or
@@ -145,6 +166,9 @@ public:
   // reverse dependency on engine policy.
   [[nodiscard]] metal::AllocationAdmission allocationAdmission() noexcept;
   void setPressure(MemoryPressure pressure) noexcept;
+  // Changes the engine budget at a safe point. Memory already resident above
+  // the new limit stays until the owner reclaims it; growth is refused.
+  void setLimitBytes(uint64_t bytes);
   [[nodiscard]] MemoryGovernorSnapshot snapshot() const noexcept;
 
 private:

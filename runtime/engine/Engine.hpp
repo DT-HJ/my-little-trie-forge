@@ -32,6 +32,10 @@ struct EngineConfig final {
   // Critical OS pressure also blocks transient command placement for already
   // resident lanes. They stay ready and resume after the pressure clears.
   std::function<bool()> dispatchPaused;
+  // Share of wall time the engine may keep commands on the GPU, 1-100. Below
+  // 100, each completed command is followed by a dispatch pause of
+  // wall * (100 - duty) / duty so a background workload leaves the GPU idle.
+  uint32_t dutyPercent = 100;
   // Owner-thread hook for an optional asynchronous prefix restore. Return
   // true only after a bounded restore has been queued; storageReady() must
   // then be delivered on the owner thread with this generation. A false
@@ -111,6 +115,13 @@ public:
   void setCompletionNotifier(std::function<void()> notifier);
 
   [[nodiscard]] bool tick(double nowMilliseconds);
+  // Owner-thread controls for a running engine. Neither cancels a request.
+  void setDutyPercent(uint32_t percent) noexcept {
+    config_.dutyPercent = percent;
+    if (percent >= 100)
+      nextDispatchMilliseconds_ = 0.0;
+  }
+  void setDispatchHeld(bool held) noexcept { dispatchHeld_ = held; }
   [[nodiscard]] bool idle() const noexcept;
   [[nodiscard]] bool commandInFlight() const noexcept {
     return pending_.has_value();
@@ -188,6 +199,9 @@ private:
     std::unique_ptr<ModelBatchTicket> ticket;
   };
   double nextHealthCheckMilliseconds_ = 0.0;
+  // Earliest time the duty-cycle limit allows the next command.
+  double nextDispatchMilliseconds_ = 0.0;
+  bool dispatchHeld_ = false;
 
   [[nodiscard]] Request &request(uint64_t requestId);
   [[nodiscard]] bool admitQueued(double nowMilliseconds);

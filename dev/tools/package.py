@@ -60,6 +60,7 @@ SERVER_FILES = (
     "crash_trace.py",
     "chat.html",
     "update_check.py",
+    "runtime_profile.py",
 )
 NOTICE_FILES = (
     "LICENSE",

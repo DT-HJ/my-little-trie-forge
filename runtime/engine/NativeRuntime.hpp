@@ -95,6 +95,10 @@ public:
   [[nodiscard]] bool reclaimDeferred() const noexcept {
     return core_.reclaimDeferred();
   }
+  void setDutyPercent(uint32_t percent) noexcept {
+    core_.setDutyPercent(percent);
+  }
+  void setDispatchHeld(bool held) noexcept { core_.setDispatchHeld(held); }
 
 private:
   struct RequestTelemetry {

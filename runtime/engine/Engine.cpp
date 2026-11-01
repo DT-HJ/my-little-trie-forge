@@ -278,6 +278,12 @@ void Engine::setCompletionNotifier(std::function<void()> notifier) {
   completionNotifier_ = std::move(notifier);
 }
 
+namespace {
+// A long idle gap lets the GPU drop its clocks, which inflates the next
+// command's wall time and, through the duty formula, the next pause.
+constexpr double kMaxDutyPauseMilliseconds = 250.0;
+} // namespace
+
 bool Engine::tick(double now) {
   model_.checkHealth();
   nextHealthCheckMilliseconds_ = now + kHealthCheckIntervalMilliseconds;
@@ -328,6 +334,13 @@ bool Engine::tick(double now) {
     std::vector<ModelStepResult> results = command.ticket->wait();
     apply(command.plan, results, command.ticket->wallMilliseconds(),
           command.ticket->prefillTimingIsRepresentative());
+    if (config_.dutyPercent < 100) {
+      nextDispatchMilliseconds_ =
+          now + std::min(kMaxDutyPauseMilliseconds,
+                         command.ticket->wallMilliseconds() *
+                             (100.0 - config_.dutyPercent) /
+                             config_.dutyPercent);
+    }
     sweepTerminal();
     return true;
   }
@@ -339,6 +352,10 @@ bool Engine::tick(double now) {
   // when the governor allows commands again, instead of turning an optional
   // pressure episode into a process-wide Metal execution failure.
   if (config_.dispatchPaused && config_.dispatchPaused())
+    return progressed;
+  if (dispatchHeld_)
+    return progressed;
+  if (config_.dutyPercent < 100 && now < nextDispatchMilliseconds_)
     return progressed;
   auto plan = scheduler_.next();
   if (std::FILE *trace = decodeReadyTrace())
@@ -395,6 +412,11 @@ std::optional<double> Engine::nextWakeupMilliseconds() const {
     if (!result || wakeup < *result)
       result = wakeup;
   }
+  // Without a command in flight, a throttled engine with work waits for the
+  // duty-cycle window instead of sleeping until the next request event.
+  if (!pending_ && config_.dutyPercent < 100 && !requests_.empty() &&
+      (!result || nextDispatchMilliseconds_ < *result))
+    result = nextDispatchMilliseconds_;
   return result;
 }
 

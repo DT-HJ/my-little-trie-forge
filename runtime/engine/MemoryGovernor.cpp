@@ -36,7 +36,7 @@ uint64_t estimateHostAvailableMemory(const HostMemoryPages &statistics,
   return usedBytes < physicalMemoryBytes ? physicalMemoryBytes - usedBytes : 0;
 }
 
-std::optional<uint64_t> queryHostAvailableMemory() noexcept {
+uint64_t queryHostPhysicalMemory() noexcept {
   // Physical capacity is immutable; don't add a sysctl to every allocation.
   static const uint64_t physicalMemoryBytes = [] {
     uint64_t bytes = 0;
@@ -44,6 +44,11 @@ std::optional<uint64_t> queryHostAvailableMemory() noexcept {
     return sysctlbyname("hw.memsize", &bytes, &size, nullptr, 0) == 0 &&
                    size == sizeof(bytes) ? bytes : uint64_t{0};
   }();
+  return physicalMemoryBytes;
+}
+
+std::optional<uint64_t> queryHostAvailableMemory() noexcept {
+  const uint64_t physicalMemoryBytes = queryHostPhysicalMemory();
   if (!physicalMemoryBytes) return std::nullopt;
   mach_port_t host = mach_host_self();
   vm_size_t pageSize = 0;
@@ -268,6 +273,14 @@ void MemoryGovernor::setPressure(MemoryPressure pressure) noexcept {
   systemPressure_ = pressure;
 }
 
+void MemoryGovernor::setLimitBytes(uint64_t bytes) {
+  if (!bytes) {
+    throw std::invalid_argument("memory governor limit must be positive");
+  }
+  std::lock_guard lock(mutex_);
+  limitBytes_ = bytes;
+}
+
 MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   std::lock_guard lock(mutex_);
   uint64_t metalObserved = observedResidentBytes();
@@ -299,6 +312,7 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
       deniedReservations_,
       hostAvailable.has_value(),
       hostAvailable.value_or(0),
+      queryHostPhysicalMemory(),
       hostReserveBytes_,
       hostHeadroom,
       systemPressure_,
@@ -340,11 +354,38 @@ void MemoryGovernor::releaseExternal(uint64_t bytes) noexcept {
   externalOwnedBytes_ -= bytes;
 }
 
+bool MemoryPressurePolicy::idleReclaimDue(
+    const MemoryGovernorSnapshot &snapshot, double nowMilliseconds,
+    bool engineIdle) noexcept {
+  if (!engineIdle) {
+    idleSinceMilliseconds_ = -1.0;
+    return false;
+  }
+  if (idleSinceMilliseconds_ < 0.0)
+    idleSinceMilliseconds_ = nowMilliseconds;
+  if (nowMilliseconds - idleSinceMilliseconds_ < kIdleReclaimDelayMilliseconds)
+    return false;
+  const uint64_t physical = snapshot.hostPhysicalBytes;
+  if (!snapshot.hostMeasurementValid || !physical)
+    return false;
+  const uint64_t used = snapshot.hostAvailableBytes < physical
+      ? physical - snapshot.hostAvailableBytes
+      : 0;
+  // Physical memory is far below 2^57 bytes, so neither product overflows.
+  return used * 100 >= physical * idleReclaimPercent_;
+}
+
 MemoryReclaimDirective MemoryPressurePolicy::update(
     const MemoryGovernorSnapshot &snapshot, double nowMilliseconds,
-    bool requestWaiting) noexcept {
+    bool requestWaiting, bool engineIdle) noexcept {
+  const bool idleReclaim =
+      idleReclaimDue(snapshot, nowMilliseconds, engineIdle);
   if (snapshot.pressure == MemoryPressure::Normal) {
     nextReclaimMilliseconds_ = 0.0;
+    // A zero target releases only empty KV extents and idle state buffers;
+    // no cached prefix is evicted.
+    if (idleReclaim)
+      return {true, false, 0, true};
     return {};
   }
   if (snapshot.pressure == MemoryPressure::Critical) {

@@ -8,9 +8,11 @@ import queue
 import re
 import secrets
 import selectors
+import shutil
 import signal
 import socket
 import sys
+import tempfile
 import threading
 import time
 import weakref
@@ -45,6 +47,7 @@ if __package__:
     from .frontend import REASONING_EFFORTS, Frontend, validate_served_model_name
     from .http_security import authenticate, validate_api_key, validate_headers
     from .latency import RequestLatency
+    from .runtime_profile import ProfileController, ProfileError
     from .metrics import (
         is_finite_number,
         metrics_dict,
@@ -86,6 +89,7 @@ else:
     from frontend import REASONING_EFFORTS, Frontend, validate_served_model_name
     from http_security import authenticate, validate_api_key, validate_headers
     from latency import RequestLatency
+    from runtime_profile import ProfileController, ProfileError
     from metrics import (
         is_finite_number,
         metrics_dict,
@@ -341,6 +345,42 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.do_GET()
 
+    def _admin_allowed(self):
+        # Without an API key the admin endpoint is for this machine only.
+        if self.server.profile is None:
+            self._safe_error(APIError(404, "not found", "not_found"))
+            return False
+        if self.server.api_key is None and self.client_address[0] not in (
+            "127.0.0.1", "::1", "::ffff:127.0.0.1",
+        ):
+            self._safe_error(
+                APIError(403, "the admin endpoint needs an API key off this machine",
+                         "permission_denied")
+            )
+            return False
+        return True
+
+    def _admin_profile_update(self):
+        if not self._admin_allowed():
+            return
+        try:
+            try:
+                length = int(self.headers.get("Content-Length", ""))
+            except ValueError:
+                length = -1
+            if not 0 < length <= 4096:
+                raise ProfileError(400, "send a JSON body of at most 4096 bytes")
+            try:
+                body = json.loads(
+                    self.rfile.read(length).decode("utf-8"),
+                    parse_constant=lambda _name: (_ for _ in ()).throw(ValueError()),
+                )
+            except (UnicodeDecodeError, ValueError):
+                raise ProfileError(400, "the body must be valid JSON") from None
+            self._json(200, self.server.profile.update(body))
+        except ProfileError as error:
+            self._safe_error(APIError(error.status, error.message, "invalid_request_error"))
+
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Allow", "GET, HEAD, POST, DELETE, OPTIONS")
@@ -371,6 +411,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
             return
         if path == "/status":
             self._json(200, self.server.status())
+            return
+        if path == "/admin/profile":
+            if self._admin_allowed():
+                self._json(200, self.server.profile.snapshot())
             return
         if path == "/metrics":
             self._send(
@@ -453,6 +497,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
         prompt_only = count_tokens or path in ("/tokenize", "/apply-template")
         anthropic = path == "/v1/messages" or count_tokens
         systemone = path == "/v1/systemone"
+        if path == "/admin/profile":
+            self._admin_profile_update()
+            return
         if path not in (
             "/v1/chat/completions",
             "/v1/responses",
@@ -1665,6 +1712,20 @@ class WaitingAdmission:
                 self.changed.notify_all()
                 raise
 
+    def set_capacity(self, capacity):
+        if (
+            isinstance(capacity, bool)
+            or not isinstance(capacity, int)
+            or not 1 <= capacity <= MAX_ACTIVE_REQUEST_LIMIT
+        ):
+            raise ValueError(
+                f"active request limit must be an integer from 1 to "
+                f"{MAX_ACTIVE_REQUEST_LIMIT}"
+            )
+        with self.changed:
+            self.capacity = capacity
+            self.changed.notify_all()
+
     def release(self):
         with self.changed:
             if self.active <= 0:
@@ -1773,6 +1834,7 @@ class FrontendServer(ThreadingHTTPServer):
             if host not in ("0.0.0.0", "::")
         }
         self.update_checker = None
+        self.profile = None
         self.instance_id = secrets.token_hex(12)
         self.started_at = time.time()
         self.generation_admission = (
@@ -1983,6 +2045,18 @@ def parse_args(argv=None):
     parser.add_argument("--ssd-quota-bytes", type=int)
     parser.add_argument("--ssd-free-floor-bytes", type=int)
     parser.add_argument(
+        "--idle-reclaim-percent",
+        type=int,
+        help="after 30s idle, release empty KV backing once host memory use "
+        "reaches this percent, 1-100 (default: 60)",
+    )
+    parser.add_argument(
+        "--gpu-duty-percent",
+        type=int,
+        help="share of wall time the GPU may be busy, 1-100; below 100 the "
+        "engine pauses after each command to run slower (default: 100)",
+    )
+    parser.add_argument(
         "--max-request-size",
         type=_parse_request_size,
         default=DEFAULT_MAX_REQUEST_BYTES,
@@ -2041,6 +2115,10 @@ def parse_args(argv=None):
         args.ssd_quota_bytes is not None or args.ssd_free_floor_bytes is not None
     ) and args.ssd_root is None:
         parser.error("SSD byte limits require --ssd-root")
+    if args.idle_reclaim_percent is not None and not 1 <= args.idle_reclaim_percent <= 100:
+        parser.error("--idle-reclaim-percent must be in [1, 100]")
+    if args.gpu_duty_percent is not None and not 1 <= args.gpu_duty_percent <= 100:
+        parser.error("--gpu-duty-percent must be in [1, 100]")
     if not 0 <= args.port <= 65535:
         parser.error("--port must be in [0, 65535]")
     return args
@@ -2063,6 +2141,12 @@ def _native_command(args):
         command.extend(("--ssd-quota-bytes", str(args.ssd_quota_bytes)))
     if args.ssd_free_floor_bytes is not None:
         command.extend(("--ssd-free-floor-bytes", str(args.ssd_free_floor_bytes)))
+    if args.idle_reclaim_percent is not None:
+        command.extend(("--idle-reclaim-percent", str(args.idle_reclaim_percent)))
+    if args.gpu_duty_percent is not None:
+        command.extend(("--gpu-duty-percent", str(args.gpu_duty_percent)))
+    if getattr(args, "control_dir", None) is not None:
+        command.extend(("--control-dir", str(args.control_dir)))
     return command
 
 
@@ -2074,6 +2158,8 @@ def main():
     args = parse_args()
     server = None
     backend = None
+    # Private directory the admin endpoint uses to hand settings to the engine.
+    args.control_dir = tempfile.mkdtemp(prefix="mltf-control-")
     # A server started in the background from a non-interactive shell inherits
     # SIGINT as ignored and Python then leaves it alone; install both stop
     # signals explicitly so scripts and supervisors can interrupt it.
@@ -2095,6 +2181,9 @@ def main():
             max_concurrent_requests=args.max_concurrent_requests,
         )
         server.server_bind()
+        server.profile = ProfileController(
+            args.control_dir, _parse_max_memory, server, (1, MAX_ACTIVE_REQUEST_LIMIT)
+        )
         thinking_codec = ThinkingCodec(load_thinking_key())
         print_status(f"Loading · {args.model}")
         tokenizer = AutoTokenizer.from_pretrained(
@@ -2186,6 +2275,7 @@ def main():
                 print_status("Stopping · releasing engine resources")
                 backend.close()
         finally:
+            shutil.rmtree(args.control_dir, ignore_errors=True)
             if server is not None:
                 server.server_close()
 
